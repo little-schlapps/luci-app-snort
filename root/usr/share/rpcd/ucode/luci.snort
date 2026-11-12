@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// rpcd ucode backend for luci-app-snort.
+// Runs inside rpcd on demand; no extra daemon is started.
+
+'use strict';
+
+import { readfile, writefile, popen, stat, unlink } from 'fs';
+import { connect } from 'ubus';
+import { cursor } from 'uci';
+
+const ALERT_FILE   = '/var/log/alert_json.txt';
+const RULES_DIR    = '/etc/snort/rules';
+const LOCAL_RULES  = '/etc/snort/local.rules';      // persistent copy, survives rule updates
+const LOCAL_ACTIVE = RULES_DIR + '/local.rules';    // copy that snort actually loads
+const UPDATE_FLAG  = '/tmp/luci-snort-update.running';
+const UPDATE_LOG   = '/tmp/luci-snort-update.log';
+const MAX_LOCAL    = 262144;                        // 256 KiB limit for local rules
+
+function clamp(v, lo, hi, dflt) {
+	v = int(v ?? dflt);
+	if (v != v)
+		v = dflt;
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
+function run(cmd) {
+	const p = popen(cmd, 'r');
+	if (!p)
+		return '';
+	const out = p.read('all') ?? '';
+	p.close();
+	return out;
+}
+
+function snort_instance() {
+	const conn = connect();
+	const svc = conn?.call('service', 'list', { name: 'snort' });
+	conn?.disconnect();
+
+	for (let name, inst in svc?.snort?.instances ?? {})
+		if (inst?.running)
+			return inst;
+
+	return null;
+}
+
+function count_rules() {
+	return int(trim(run(`cat ${RULES_DIR}/*.rules 2>/dev/null | grep -cE '^[[:space:]]*(alert|drop|block|reject|pass|rewrite)[[:space:]]'`)) || '0');
+}
+
+function restart_snort() {
+	system('/etc/init.d/snort restart >/dev/null 2>&1 &');
+}
+
+const methods = {
+	status: {
+		call: function() {
+			const inst = snort_instance();
+			const uci = cursor();
+			let rss_kb = null;
+
+			if (inst?.pid) {
+				const m = match(readfile(`/proc/${inst.pid}/status`) ?? '', /VmRSS:[ \t]+([0-9]+)/);
+				if (m)
+					rss_kb = int(m[1]);
+			}
+
+			const st = stat(ALERT_FILE);
+
+			return {
+				running: !!inst,
+				pid: inst?.pid ?? null,
+				rss_kb: rss_kb,
+				enabled: uci.get('snort', 'snort', 'enabled') == '1',
+				mode: uci.get('snort', 'snort', 'mode') ?? 'ids',
+				interface: uci.get('snort', 'snort', 'interface') ?? '',
+				version: trim(run("snort -V 2>&1 | sed -n 's/.*Version \\([0-9.]*\\).*/\\1/p' | head -n1")),
+				rules: count_rules(),
+				local_rules: stat(LOCAL_ACTIVE) != null,
+				alerts_total: st ? int(trim(run(`wc -l < ${ALERT_FILE}`)) || '0') : 0,
+				alert_file_size: st?.size ?? 0,
+				updating: stat(UPDATE_FLAG) != null,
+				update_log: trim(run(`tail -n 5 ${UPDATE_LOG} 2>/dev/null`))
+			};
+		}
+	},
+
+	summary: {
+		args: { lines: 5000, top: 25, recent: 50 },
+		call: function(req) {
+			const lines  = clamp(req.args?.lines, 100, 50000, 5000);
+			const top    = clamp(req.args?.top, 1, 200, 25);
+			const recent = clamp(req.args?.recent, 1, 500, 50);
+
+			if (!stat(ALERT_FILE))
+				return { analysed: 0, rules: [], sources: [], recent: [] };
+
+			const by_rule = {}, by_src = {}, events = [];
+
+			for (let line in split(run(`tail -n ${lines} ${ALERT_FILE}`), '\n')) {
+				if (!length(line))
+					continue;
+
+				let a;
+				try { a = json(line); } catch (e) { continue; }
+				if (type(a) != 'object')
+					continue;
+
+				const key = `${a.gid ?? 1}:${a.sid ?? 0}`;
+				let r = by_rule[key];
+				if (!r)
+					r = by_rule[key] = { gid: a.gid ?? 1, sid: a.sid ?? 0, rev: a.rev, msg: a.msg ?? '', count: 0, first: a.timestamp, last: null, sources: {}, targets: {} };
+
+				r.count++;
+				r.last = a.timestamp;
+				if (a.src_addr) r.sources[a.src_addr] = (r.sources[a.src_addr] ?? 0) + 1;
+				if (a.dst_addr) r.targets[a.dst_addr] = (r.targets[a.dst_addr] ?? 0) + 1;
+
+				if (a.src_addr)
+					by_src[a.src_addr] = (by_src[a.src_addr] ?? 0) + 1;
+
+				push(events, {
+					timestamp: a.timestamp, proto: a.proto, gid: a.gid ?? 1, sid: a.sid ?? 0,
+					msg: a.msg ?? '', action: a.action,
+					src: a.src_addr, sport: a.src_port, dst: a.dst_addr, dport: a.dst_port
+				});
+			}
+
+			const top_keys = (obj, n) => slice(sort(keys(obj), (x, y) => obj[y] - obj[x]), 0, n);
+
+			const rules = [];
+			for (let key, r in by_rule)
+				push(rules, {
+					gid: r.gid, sid: r.sid, rev: r.rev, msg: r.msg, count: r.count,
+					first: r.first, last: r.last,
+					sources: top_keys(r.sources, 3), source_count: length(keys(r.sources)),
+					targets: top_keys(r.targets, 3), target_count: length(keys(r.targets))
+				});
+
+			const sources = [];
+			for (let ip in top_keys(by_src, top))
+				push(sources, { addr: ip, count: by_src[ip] });
+
+			return {
+				analysed: length(events),
+				rules: slice(sort(rules, (x, y) => y.count - x.count), 0, top),
+				sources: sources,
+				recent: reverse(slice(events, -recent))
+			};
+		}
+	},
+
+	log: {
+		args: { lines: 200 },
+		call: function(req) {
+			const lines = clamp(req.args?.lines, 10, 2000, 200);
+			return { log: run(`logread -e 'snort' 2>/dev/null | tail -n ${lines}`) };
+		}
+	},
+
+	service: {
+		args: { action: 'restart' },
+		call: function(req) {
+			const action = req.args?.action;
+			if (!(action in [ 'start', 'stop', 'restart' ]))
+				return { result: false, error: 'invalid action' };
+
+			system(`/etc/init.d/snort ${action} >/dev/null 2>&1 &`);
+			return { result: true };
+		}
+	},
+
+	update_rules: {
+		call: function() {
+			if (stat(UPDATE_FLAG))
+				return { result: false, error: 'update already running' };
+
+			system(`( touch ${UPDATE_FLAG}; /usr/bin/snort-rules; ` +
+				`[ -f ${LOCAL_RULES} ] && cp ${LOCAL_RULES} ${LOCAL_ACTIVE}; ` +
+				`/etc/init.d/snort restart; rm -f ${UPDATE_FLAG} ) >${UPDATE_LOG} 2>&1 &`);
+
+			return { result: true };
+		}
+	},
+
+	get_local_rules: {
+		call: function() {
+			return { content: readfile(LOCAL_RULES) ?? readfile(LOCAL_ACTIVE) ?? '' };
+		}
+	},
+
+	set_local_rules: {
+		args: { content: '', restart: true },
+		call: function(req) {
+			let content = req.args?.content ?? '';
+			if (type(content) != 'string' || length(content) > MAX_LOCAL)
+				return { result: false, error: 'invalid content' };
+
+			content = replace(content, /\r\n/g, '\n');
+			if (length(content) && substr(content, -1) != '\n')
+				content += '\n';
+
+			if (!length(trim(content))) {
+				unlink(LOCAL_RULES);
+				unlink(LOCAL_ACTIVE);
+			}
+			else if (!writefile(LOCAL_RULES, content) || !writefile(LOCAL_ACTIVE, content)) {
+				return { result: false, error: 'write failed' };
+			}
+
+			if (req.args?.restart !== false)
+				restart_snort();
+
+			return { result: true };
+		}
+	},
+
+	clear_alerts: {
+		call: function() {
+			if (stat(ALERT_FILE))
+				writefile(ALERT_FILE, '');
+			return { result: true };
+		}
+	}
+};
+
+return { 'luci.snort': methods };

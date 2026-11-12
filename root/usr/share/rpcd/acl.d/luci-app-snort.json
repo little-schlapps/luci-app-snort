@@ -1,0 +1,17 @@
+{
+	"luci-app-snort": {
+		"description": "Grant access to the Snort IDS/IPS interface",
+		"read": {
+			"ubus": {
+				"luci.snort": [ "status", "summary", "log", "get_local_rules" ]
+			},
+			"uci": [ "snort" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.snort": [ "service", "update_rules", "set_local_rules", "clear_alerts" ]
+			},
+			"uci": [ "snort" ]
+		}
+	}
+}
