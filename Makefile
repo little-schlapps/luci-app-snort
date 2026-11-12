@@ -11,8 +11,7 @@ LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +snort3
 LUCI_PKGARCH:=all
 
 PKG_LICENSE:=Apache-2.0
-# Set a real name/address before publishing or submitting upstream.
-PKG_MAINTAINER:=Your Name <you@example.com>
+PKG_MAINTAINER:=little-schlapps <little-schlapps@users.noreply.github.com>
 
 include ../../luci.mk
 

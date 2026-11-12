@@ -20,7 +20,7 @@ const callSetLocal = rpc.declare({
 const EXAMPLE =
 	'# One rule per line. Use SIDs of 1000000 and above for your own rules.\n' +
 	'# Example: alert on Modbus/TCP traffic from the IoT network\n' +
-	'# alert tcp 10.255.254.0/24 any -> any 502 ( msg:"IoT host talking Modbus"; sid:1000010; rev:1; )\n';
+	'# alert tcp 192.168.10.0/24 any -> any 502 ( msg:"IoT host talking Modbus"; sid:1000010; rev:1; )\n';
 
 return view.extend({
 	load: function() {
