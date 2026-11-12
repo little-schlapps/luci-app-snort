@@ -123,11 +123,12 @@ return view.extend({
 		o.default = 'ids';
 
 		o = s.option(form.ListValue, 'method', _('Capture method'),
-			_('IDS works with pcap or afpacket. IPS requires nfq (netfilter queue).'));
+			_('afpacket is recommended for IDS: pcap can hold packets back on quiet interfaces, ' +
+			  'delaying alerts by a minute or more. IPS requires nfq (netfilter queue).'));
+		o.value('afpacket', _('afpacket (recommended)'));
 		o.value('pcap', 'pcap');
-		o.value('afpacket', 'afpacket');
 		o.value('nfq', 'nfq');
-		o.default = 'pcap';
+		o.default = 'afpacket';
 
 		o = s.option(form.ListValue, 'action', _('IPS action'),
 			_('How matching traffic is handled in IPS mode. "default" uses each rule\'s own action.'));

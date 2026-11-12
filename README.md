@@ -66,6 +66,13 @@ Then log out of LuCI and back in so the new ACL is applied to your session.
 - **Alerts are kept in RAM** (`/var/log`) by default and cleared on reboot.
   Change *Log directory* to persistent storage (e.g. a USB drive) to keep them;
   avoid putting a busy alert log on internal flash.
+- **Use `afpacket` capture for IDS.** With the `pcap` method, packets on quiet
+  interfaces can reach Snort in delayed batches, so alerts show up 60+ seconds
+  late (measured on an RB5009: ~66 s with pcap, immediate with afpacket).
+- **Testing with traffic generated on the router itself:** locally originated
+  TCP/UDP packets are captured before checksum offload fills in the checksum,
+  so Snort discards them and rules will not match. Test with traffic from
+  another host (ICMP from the router works).
 - **Performance:** Snort is CPU-heavy. On typical routers use it on low-volume
   segments (IoT/camera/OT networks) rather than a full gigabit WAN.
 - Syslog output: add `alert_syslog = { level = 'info' }` to a Lua file such as
